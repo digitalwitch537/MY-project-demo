@@ -124,6 +124,26 @@ jobs:
             "sudo -n bash /opt/mern-bootstrap/infra/ec2/bootstrap.sh"
           echo "::endgroup::"
 
+      - name: Stage 3b - Fix permissions on EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          set -euo pipefail
+          echo "::group::Fixing permissions"
+          ssh -i "$HOME/.ssh/ec2_key" "${EC2_USER}@${EC2_HOST}" << 'EOF'
+            sudo usermod -aG docker ${USER} || true
+            sudo usermod -aG docker github-runner || true
+            sudo chown -R ${USER}:docker /opt/sonarqube 2>/dev/null || sudo chown -R ubuntu:docker /opt/sonarqube 2>/dev/null || true
+            sudo chown -R ${USER}:docker /opt/mern-app 2>/dev/null || true
+            sudo chown -R ${USER}:docker /opt/mern-staging 2>/dev/null || true
+            sudo chmod 750 /opt/sonarqube 2>/dev/null || true
+            sudo chmod 644 /opt/sonarqube/compose.yml 2>/dev/null || true
+            sudo chmod 600 /opt/sonarqube/.env 2>/dev/null || true
+            sudo chmod 644 /opt/sonarqube/.sonar-token 2>/dev/null || true
+          EOF
+          echo "::endgroup::"
+
       - name: Stage 3 - Remove remote bootstrap secrets
         if: always()
         env:
