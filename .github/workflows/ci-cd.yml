@@ -79,10 +79,11 @@ jobs:
       - name: Stage 1 - AWS instance identity
         continue-on-error: true
         run: |
-          set -euo pipefail
+          set +e
           echo "::group::AWS identity"
-          aws sts get-caller-identity --output table
+          aws sts get-caller-identity --output table 2>&1 || echo "AWS credentials not configured (optional)"
           echo "::endgroup::"
+          set -e
 
       - name: Stage 1 - Ensure SonarQube is running
         run: |
@@ -96,7 +97,7 @@ jobs:
           status=$(curl -fsS "${SONAR_HOST_URL}/api/system/status" 2>/dev/null | jq -r '.status // empty' 2>/dev/null || true)
           if [ "$status" != "UP" ]; then
             echo "SonarQube is ${status:-unreachable}; starting it..."
-            docker compose -p sonarqube \
+            sudo docker compose -p sonarqube \
               -f /opt/sonarqube/compose.yml \
               --env-file /opt/sonarqube/.env \
               up -d --remove-orphans
@@ -110,11 +111,11 @@ jobs:
             sleep 5
           done
           if [ "$status" != "UP" ]; then
-            docker compose -p sonarqube -f /opt/sonarqube/compose.yml --env-file /opt/sonarqube/.env logs --tail=200 sonarqube || true
+            sudo docker compose -p sonarqube -f /opt/sonarqube/compose.yml --env-file /opt/sonarqube/.env logs --tail=200 sonarqube || true
             echo "::error::SonarQube did not become UP"
             exit 1
           fi
-          docker compose -p sonarqube -f /opt/sonarqube/compose.yml --env-file /opt/sonarqube/.env ps
+          sudo docker compose -p sonarqube -f /opt/sonarqube/compose.yml --env-file /opt/sonarqube/.env ps
           echo "::endgroup::"
 
       - name: Stage 1 - Docker Hub login
