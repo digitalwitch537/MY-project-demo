@@ -193,33 +193,33 @@ curl -fsS -u "admin:${SONAR_ADMIN_PASSWORD}" -X POST "${SONAR_URL}/api/projects/
 	--data-urlencode "name=${SONAR_PROJECT_NAME}" >/dev/null 2>&1 || true
 
 log "Creating the security quality gate"
-AUTH_PASS="$SONAR_ADMIN_PASSWORD"
-if [ -f /opt/sonarqube/.sonar-token ]; then
-	TOKEN_VAL=$(cat /opt/sonarqube/.sonar-token)
-fi
-
+AUTH_PASS="${SONAR_ADMIN_PASSWORD:-admin}"
 gate_id=""
-# Try with admin password first
-for try_pass in "${AUTH_PASS}" "admin"; do
+
+# Try to find existing gate with any password
+for try_pass in "${AUTH_PASS}" "admin" "${SONAR_ADMIN_PASSWORD:-}"; do
+	[ -z "$try_pass" ] && continue
 	gate_id=$(curl -fsS -u "admin:${try_pass}" "${SONAR_URL}/api/qualitygates/list" 2>/dev/null \
-		| jq -r --arg name "$SONAR_QUALITY_GATE" '.qualitygates[]? | select(.name == $name) | .id' | head -n 1)
+		| jq -r --arg name "$SONAR_QUALITY_GATE" '.qualitygates[]? | select(.name == $name) | .id' 2>/dev/null | head -n 1)
 	if [ -n "$gate_id" ] && [ "$gate_id" != "null" ]; then
 		AUTH_PASS="$try_pass"
 		break
 	fi
 done
 
+# Try to create if not found
 if [ -z "$gate_id" ] || [ "$gate_id" = "null" ]; then
 	log "Quality gate not found, attempting to create: ${SONAR_QUALITY_GATE}"
 	for try_pass in "${AUTH_PASS}" "admin"; do
-		resp=$(curl -s -u "admin:${try_pass}" -X POST "${SONAR_URL}/api/qualitygates/create" \
-			--data-urlencode "name=${SONAR_QUALITY_GATE}" 2>&1)
-		echo "Create response: $resp"
+		[ -z "$try_pass" ] && continue
+		curl -s -u "admin:${try_pass}" -X POST "${SONAR_URL}/api/qualitygates/create" \
+			--data-urlencode "name=${SONAR_QUALITY_GATE}" >/dev/null 2>&1
 	done
 	sleep 10
 	for try_pass in "${AUTH_PASS}" "admin"; do
+		[ -z "$try_pass" ] && continue
 		gate_id=$(curl -fsS -u "admin:${try_pass}" "${SONAR_URL}/api/qualitygates/list" 2>/dev/null \
-			| jq -r --arg name "$SONAR_QUALITY_GATE" '.qualitygates[]? | select(.name == $name) | .id' | head -n 1)
+			| jq -r --arg name "$SONAR_QUALITY_GATE" '.qualitygates[]? | select(.name == $name) | .id' 2>/dev/null | head -n 1)
 		if [ -n "$gate_id" ] && [ "$gate_id" != "null" ]; then
 			AUTH_PASS="$try_pass"
 			break
@@ -231,8 +231,8 @@ SONAR_ADMIN_PASSWORD="$AUTH_PASS"
 
 if [ -n "$gate_id" ] && [ "$gate_id" != "null" ]; then
 	echo "Found quality gate ID: $gate_id"
-	gate_json=$(curl -fsS -u "admin:${SONAR_ADMIN_PASSWORD}" "${SONAR_URL}/api/qualitygates/show?id=${gate_id}" 2>/dev/null || true)
-	existing_conditions=$(printf '%s' "$gate_json" | jq -c '.conditions[]?' 2>/dev/null || true)
+	gate_json=$(curl -fsS -u "admin:${SONAR_ADMIN_PASSWORD}" "${SONAR_URL}/api/qualitygates/show?id=${gate_id}" 2>/dev/null || echo '{}')
+	existing_conditions=$(echo "$gate_json" | jq -c '.conditions[]?' 2>/dev/null || true)
 
 	add_condition() {
 		local metric="$1"
@@ -241,9 +241,7 @@ if [ -n "$gate_id" ] && [ "$gate_id" != "null" ]; then
 		local condition_id=""
 
 		if [ -n "$existing_conditions" ]; then
-			condition_id=$(printf '%s\n' "$existing_conditions" \
-				| jq -r --arg metric "$metric" 'select(.metric == $metric) | .id' \
-				| head -n 1)
+			condition_id=$(echo "$existing_conditions" | jq -r --arg metric "$metric" 'select(.metric == $metric) | .id' 2>/dev/null | head -n 1)
 		fi
 
 		if [ -n "$condition_id" ] && [ "$condition_id" != "null" ]; then
@@ -272,8 +270,9 @@ if [ -n "$gate_id" ] && [ "$gate_id" != "null" ]; then
 	curl -fsS -u "admin:${SONAR_ADMIN_PASSWORD}" -X POST "${SONAR_URL}/api/qualitygates/select" \
 		--data-urlencode "gateId=${gate_id}" \
 		--data-urlencode "projectKey=${SONAR_PROJECT_KEY}" >/dev/null 2>&1 || true
+	echo "Quality gate configured"
 else
-	echo "WARNING: Could not find/create quality gate ${SONAR_QUALITY_GATE}; continuing without it" >&2
+	echo "WARNING: Could not find/create quality gate ${SONAR_QUALITY_GATE}; continuing" >&2
 fi
 
 curl -fsS -u "admin:${SONAR_ADMIN_PASSWORD}" -X POST "${SONAR_URL}/api/new_code_periods/set" \
