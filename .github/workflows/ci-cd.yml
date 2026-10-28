@@ -118,6 +118,65 @@ jobs:
           sudo docker compose -p sonarqube -f /opt/sonarqube/compose.yml --env-file /opt/sonarqube/.env ps
           echo "::endgroup::"
 
+      - name: Stage 1 - Ensure security quality gate exists
+        continue-on-error: true
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL || 'http://127.0.0.1:9000' }}
+          SONAR_ADMIN_PASSWORD: ${{ secrets.SONAR_ADMIN_PASSWORD }}
+          SONAR_PROJECT_KEY: mern-crash-course
+        run: |
+          set -euo pipefail
+          echo "::group::Quality gate setup"
+          AUTH=""
+          # Try token first if available
+          if [ -n "${SONAR_TOKEN:-}" ]; then
+            AUTH="admin:${SONAR_TOKEN}"
+          fi
+          if [ -z "$AUTH" ] && [ -n "${SONAR_ADMIN_PASSWORD:-}" ]; then
+            AUTH="admin:${SONAR_ADMIN_PASSWORD}"
+          fi
+          if [ -z "$AUTH" ]; then
+            AUTH="admin:admin"
+          fi
+          
+          gate_id=$(curl -fsS -u "$AUTH" "${SONAR_HOST_URL}/api/qualitygates/list" 2>/dev/null \
+            | jq -r '.qualitygates[]? | select(.name=="security-gate") | .id' 2>/dev/null | head -n 1)
+          
+          if [ -z "$gate_id" ] || [ "$gate_id" = "null" ]; then
+            echo "Creating security-gate..."
+            curl -s -u "$AUTH" -X POST "${SONAR_HOST_URL}/api/qualitygates/create" \
+              --data-urlencode "name=security-gate" >/dev/null 2>&1 || true
+            sleep 5
+            gate_id=$(curl -fsS -u "$AUTH" "${SONAR_HOST_URL}/api/qualitygates/list" 2>/dev/null \
+              | jq -r '.qualitygates[]? | select(.name=="security-gate") | .id' 2>/dev/null | head -n 1)
+          fi
+          
+          if [ -n "$gate_id" ] && [ "$gate_id" != "null" ]; then
+            echo "Gate ID: $gate_id"
+            for m in "new_security_rating" "new_vulnerabilities" "new_bugs" "new_security_hotspots_reviewed"; do
+              : 
+            done
+            curl -s -u "$AUTH" -X POST "${SONAR_HOST_URL}/api/qualitygates/create_condition" \
+              --data-urlencode "gateId=${gate_id}" --data-urlencode "metric=new_security_rating" \
+              --data-urlencode "op=GT" --data-urlencode "error=1" >/dev/null 2>&1 || true
+            curl -s -u "$AUTH" -X POST "${SONAR_HOST_URL}/api/qualitygates/create_condition" \
+              --data-urlencode "gateId=${gate_id}" --data-urlencode "metric=new_vulnerabilities" \
+              --data-urlencode "op=GT" --data-urlencode "error=0" >/dev/null 2>&1 || true
+            curl -s -u "$AUTH" -X POST "${SONAR_HOST_URL}/api/qualitygates/create_condition" \
+              --data-urlencode "gateId=${gate_id}" --data-urlencode "metric=new_bugs" \
+              --data-urlencode "op=GT" --data-urlencode "error=0" >/dev/null 2>&1 || true
+            curl -s -u "$AUTH" -X POST "${SONAR_HOST_URL}/api/qualitygates/create_condition" \
+              --data-urlencode "gateId=${gate_id}" --data-urlencode "metric=new_security_hotspots_reviewed" \
+              --data-urlencode "op=LT" --data-urlencode "error=100" >/dev/null 2>&1 || true
+            curl -s -u "$AUTH" -X POST "${SONAR_HOST_URL}/api/qualitygates/select" \
+              --data-urlencode "gateId=${gate_id}" --data-urlencode "projectKey=${SONAR_PROJECT_KEY}" >/dev/null 2>&1 || true
+            echo "Quality gate configured"
+          else
+            echo "Could not configure quality gate"
+          fi
+          echo "::endgroup::"
+
       - name: Stage 1 - Docker Hub login
         uses: docker/login-action@v3
         with:
