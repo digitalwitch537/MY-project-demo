@@ -193,31 +193,41 @@ curl -fsS -u "admin:${SONAR_ADMIN_PASSWORD}" -X POST "${SONAR_URL}/api/projects/
 	--data-urlencode "name=${SONAR_PROJECT_NAME}" >/dev/null 2>&1 || true
 
 log "Creating the security quality gate"
+AUTH_PASS="$SONAR_ADMIN_PASSWORD"
+if [ -f /opt/sonarqube/.sonar-token ]; then
+	TOKEN_VAL=$(cat /opt/sonarqube/.sonar-token)
+fi
+
 gate_id=""
-for try_pass in "${SONAR_ADMIN_PASSWORD}" "admin"; do
+# Try with admin password first
+for try_pass in "${AUTH_PASS}" "admin"; do
 	gate_id=$(curl -fsS -u "admin:${try_pass}" "${SONAR_URL}/api/qualitygates/list" 2>/dev/null \
 		| jq -r --arg name "$SONAR_QUALITY_GATE" '.qualitygates[]? | select(.name == $name) | .id' | head -n 1)
 	if [ -n "$gate_id" ] && [ "$gate_id" != "null" ]; then
+		AUTH_PASS="$try_pass"
 		break
 	fi
 done
 
 if [ -z "$gate_id" ] || [ "$gate_id" = "null" ]; then
 	log "Quality gate not found, attempting to create: ${SONAR_QUALITY_GATE}"
-	for try_pass in "${SONAR_ADMIN_PASSWORD}" "admin"; do
-		curl -fsS -u "admin:${try_pass}" -X POST "${SONAR_URL}/api/qualitygates/create" \
-			--data-urlencode "name=${SONAR_QUALITY_GATE}" >/dev/null 2>&1 || true
+	for try_pass in "${AUTH_PASS}" "admin"; do
+		resp=$(curl -s -u "admin:${try_pass}" -X POST "${SONAR_URL}/api/qualitygates/create" \
+			--data-urlencode "name=${SONAR_QUALITY_GATE}" 2>&1)
+		echo "Create response: $resp"
 	done
-	sleep 5
-	for try_pass in "${SONAR_ADMIN_PASSWORD}" "admin"; do
+	sleep 10
+	for try_pass in "${AUTH_PASS}" "admin"; do
 		gate_id=$(curl -fsS -u "admin:${try_pass}" "${SONAR_URL}/api/qualitygates/list" 2>/dev/null \
 			| jq -r --arg name "$SONAR_QUALITY_GATE" '.qualitygates[]? | select(.name == $name) | .id' | head -n 1)
 		if [ -n "$gate_id" ] && [ "$gate_id" != "null" ]; then
-			SONAR_ADMIN_PASSWORD="$try_pass"
+			AUTH_PASS="$try_pass"
 			break
 		fi
 	done
 fi
+
+SONAR_ADMIN_PASSWORD="$AUTH_PASS"
 
 if [ -n "$gate_id" ] && [ "$gate_id" != "null" ]; then
 	echo "Found quality gate ID: $gate_id"
