@@ -1,0 +1,994 @@
+name: Build, Scan, and Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_dast:
+        description: Run the full active ZAP scan against staging
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  security-events: write
+
+concurrency:
+  group: mern-pipeline
+  cancel-in-progress: false
+
+env:
+  DOCKERHUB_NAMESPACE: ${{ secrets.DOCKERHUB_USERNAME }}
+  IMAGE_TAG: sha-${{ github.sha }}
+  SONAR_HOST_URL: http://127.0.0.1:9000
+  SONAR_PROJECT_KEY: mern-crash-course
+  APP_URL: http://127.0.0.1
+
+jobs:
+  preflight:
+    name: Stage 1 - Preflight and tool checks
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, mern-prod]
+    timeout-minutes: 15
+    steps:
+      - name: Stage 1 - Print environment and capacity
+        run: |
+          set -euo pipefail
+          echo "::group::Environment"
+          date -u
+          uname -a
+          docker version
+          docker compose version
+          trivy --version
+          aws --version || true
+          echo "::endgroup::"
+          echo "::group::Capacity"
+          free -h
+          df -h /
+          docker stats --no-stream || true
+          echo "::endgroup::"
+
+      - name: Stage 1 - Validate required secrets
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in SONAR_TOKEN NVD_API_KEY DOCKERHUB_USERNAME DOCKERHUB_TOKEN; do
+            value="${!name:-}"
+            if [ -z "$value" ]; then
+              echo "::error::Missing GitHub secret ${name}"
+              missing=1
+            else
+              echo "${name}: present"
+            fi
+          done
+          if ! printf '%s' "${DOCKERHUB_USERNAME:-}" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$'; then
+            echo "::error::DOCKERHUB_USERNAME contains invalid characters"
+            missing=1
+          fi
+          exit "$missing"
+
+      - name: Stage 1 - AWS instance identity
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          echo "::group::AWS identity"
+          aws sts get-caller-identity --output table
+          echo "::endgroup::"
+
+      - name: Stage 1 - Ensure SonarQube is running
+        run: |
+          set -euo pipefail
+          echo "::group::SonarQube startup"
+          status=$(curl -fsS "${SONAR_HOST_URL}/api/system/status" 2>/dev/null | jq -r '.status // empty' 2>/dev/null || true)
+          if [ "$status" != "UP" ]; then
+            echo "SonarQube is ${status:-unreachable}; starting it..."
+            docker compose -p sonarqube \
+              -f /opt/sonarqube/compose.yml \
+              --env-file /opt/sonarqube/.env \
+              up -d --remove-orphans
+          fi
+          for attempt in $(seq 1 90); do
+            status=$(curl -fsS "${SONAR_HOST_URL}/api/system/status" 2>/dev/null | jq -r '.status // empty' 2>/dev/null || true)
+            echo "SonarQube status (${attempt}/90): ${status:-unreachable}"
+            if [ "$status" = "UP" ]; then
+              break
+            fi
+            sleep 5
+          done
+          if [ "$status" != "UP" ]; then
+            docker compose -p sonarqube -f /opt/sonarqube/compose.yml --env-file /opt/sonarqube/.env logs --tail=200 sonarqube || true
+            echo "::error::SonarQube did not become UP"
+            exit 1
+          fi
+          docker compose -p sonarqube -f /opt/sonarqube/compose.yml --env-file /opt/sonarqube/.env ps
+          echo "::endgroup::"
+
+      - name: Stage 1 - Docker Hub login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Stage 1 - Summary
+        run: |
+          set -euo pipefail
+          echo "::group::Preflight summary"
+          public_ip=""
+          imds_token=$(curl -fsS -X PUT "http://169.254.169.254/latest/api/token" \
+            -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
+          if [ -n "$imds_token" ]; then
+            public_ip=$(curl -fsS -H "X-aws-ec2-metadata-token: ${imds_token}" \
+              "http://169.254.169.254/latest/meta-data/public-ipv4" 2>/dev/null || true)
+          fi
+          echo "Public IP: ${public_ip:-unknown}"
+          echo "Image tag: ${IMAGE_TAG}"
+          echo "Application URL: http://${public_ip:-<ec2-public-ip>}"
+          {
+            echo "## Stage 1: Preflight"
+            echo ""
+            echo "- Host: $(hostname)"
+            echo "- Image tag: \`${IMAGE_TAG}\`"
+            echo "- Application URL: http://${public_ip:-<ec2-public-ip>}"
+            echo "- SonarQube: ${SONAR_HOST_URL}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::endgroup::"
+
+  sast-quality:
+    name: Stage 2 - SonarQube SAST and quality gate
+    needs: preflight
+    runs-on: [self-hosted, linux, x64, mern-prod]
+    timeout-minutes: 30
+    steps:
+      - name: Stage 2 - Checkout
+        uses: actions/checkout@v4
+
+      - name: Stage 2 - Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            frontend/package-lock.json
+
+      - name: Stage 2 - Install dependencies
+        run: |
+          set -euo pipefail
+          echo "::group::Root dependencies"
+          npm ci --no-audit --no-fund --loglevel=info
+          echo "::endgroup::"
+          echo "::group::Frontend dependencies"
+          npm ci --prefix frontend --no-audit --no-fund --loglevel=info
+          echo "::endgroup::"
+
+      - name: Stage 2 - Prepare DAST source file
+        run: |
+          set -euo pipefail
+          mkdir -p dast reports
+          if [ ! -f dast/zap-findings.js ]; then
+            printf 'export const zapFindings = [];\n' > dast/zap-findings.js
+          fi
+          echo "DAST source file ready"
+
+      - name: Stage 2 - Run SonarQube scan and quality gate
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "::group::SonarQube analysis"
+          set +e
+          bash scripts/sonar-scan.sh 2>&1 | tee reports/sonar-scan.log
+          sonar_rc=${PIPESTATUS[0]}
+          set -e
+          curl -fsS -u "${SONAR_TOKEN}:" \
+            "${SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=${SONAR_PROJECT_KEY}" \
+            -o reports/quality-gate.json 2>/dev/null || true
+          if [ -f reports/quality-gate.json ] && [ -s reports/quality-gate.json ]; then
+            jq . reports/quality-gate.json || true
+            {
+              echo "## Stage 2: SonarQube"
+              echo ""
+              jq -r '
+                "**Quality gate:** `" + (.projectStatus.status // "UNKNOWN") + "`\n\n" +
+                "| Condition | Status | Actual |\n|---|---|---|\n" +
+                ((.projectStatus.conditions // []) | map("| " + .metricKey + " | " + .status + " | " + (.actualValue // "") + " |") | join("\n"))
+              ' reports/quality-gate.json >> "$GITHUB_STEP_SUMMARY" || true
+            }
+          fi
+          echo "::endgroup::"
+          if [ "$sonar_rc" -ne 0 ]; then
+            echo "::error::SonarQube analysis or quality gate failed"
+            exit "$sonar_rc"
+          fi
+
+      - name: Stage 2 - Upload Sonar reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-reports
+          path: reports/
+          if-no-files-found: warn
+
+      # SonarQube left running after SAST for use by later stages (DAST import)
+
+  deps-files-scan:
+    name: Stage 3 - Dependency and file scans
+    needs: sast-quality
+    runs-on: [self-hosted, linux, x64, mern-prod]
+    timeout-minutes: 60
+    steps:
+      - name: Stage 3 - Checkout
+        uses: actions/checkout@v4
+
+      - name: Stage 3 - Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Stage 3 - Print scan plan
+        run: |
+          set -euo pipefail
+          echo "::group::Scan plan"
+          echo "1. npm audit (root and frontend)"
+          echo "2. Trivy filesystem, secret, and misconfiguration scans"
+          echo "3. OWASP Dependency-Check with NVD API key"
+          echo "4. SARIF upload to GitHub Security"
+          echo "::endgroup::"
+          mkdir -p reports
+          chmod 777 reports
+
+      - name: Stage 3 - npm audit
+        run: |
+          set -euo pipefail
+          echo "::group::npm audit"
+          set +e
+          npm audit --audit-level=high --json > reports/npm-audit-root.json
+          root_rc=$?
+          npm audit --prefix frontend --audit-level=high --json > reports/npm-audit-frontend.json
+          frontend_rc=$?
+          set -e
+          echo "::endgroup::"
+          echo "::group::npm audit summary"
+          jq '.metadata.vulnerabilities // .' reports/npm-audit-root.json 2>/dev/null || cat reports/npm-audit-root.json
+          jq '.metadata.vulnerabilities // .' reports/npm-audit-frontend.json 2>/dev/null || cat reports/npm-audit-frontend.json
+          if [ "$root_rc" -ne 0 ] || [ "$frontend_rc" -ne 0 ]; then
+            echo "::warning::npm audit reported high/critical vulnerabilities; see artifacts"
+          fi
+          echo "::endgroup::"
+
+      - name: Stage 3 - Trivy filesystem and config scans
+        run: |
+          set -euo pipefail
+          echo "::group::Trivy filesystem scan"
+          set +e
+          trivy fs \
+            --scanners vuln,secret,misconfig \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            --ignore-unfixed \
+            --skip-dirs node_modules \
+            --skip-dirs frontend/node_modules \
+            --skip-dirs .git \
+            --skip-dirs reports \
+            --format table \
+            . 2>&1 | tee reports/trivy-fs.log
+          fs_rc=${PIPESTATUS[0]}
+          trivy fs \
+            --scanners vuln,secret,misconfig \
+            --skip-dirs node_modules \
+            --skip-dirs frontend/node_modules \
+            --skip-dirs .git \
+            --skip-dirs reports \
+            --format sarif \
+            --output reports/trivy-fs.sarif \
+            . >/dev/null 2>&1 || true
+          echo "::endgroup::"
+          echo "::group::Trivy configuration scan"
+          trivy config \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            --format table \
+            . 2>&1 | tee reports/trivy-config.log
+          config_rc=${PIPESTATUS[0]}
+          trivy config \
+            --format sarif \
+            --output reports/trivy-config.sarif \
+            . >/dev/null 2>&1 || true
+          set -e
+          echo "::endgroup::"
+          echo "TRIVY_FS_RC=$fs_rc" >> "$GITHUB_ENV"
+          echo "TRIVY_CONFIG_RC=$config_rc" >> "$GITHUB_ENV"
+
+      - name: Stage 3 - OWASP Dependency-Check
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+        run: |
+          set -euo pipefail
+          echo "::group::OWASP Dependency-Check"
+          set +e
+          docker run --rm \
+            --memory=2g \
+            -v "${PWD}:/src:ro" \
+            -v depcheck-data:/usr/share/dependency-check/data \
+            -v "${PWD}/reports:/report" \
+            owasp/dependency-check:13.0.0 \
+            --scan /src \
+            --exclude "/src/node_modules" \
+            --exclude "/src/frontend/node_modules" \
+            --exclude "/src/.git" \
+            --format JSON \
+            --format HTML \
+            --format SARIF \
+            --out /report \
+            --project "mern-crash-course" \
+            --nvdApiKey "${NVD_API_KEY}" \
+            --failOnCVSS 7 2>&1 | tee reports/dependency-check.log
+          depcheck_rc=${PIPESTATUS[0]}
+          set -e
+          echo "::endgroup::"
+          echo "DEPCHECK_RC=$depcheck_rc" >> "$GITHUB_ENV"
+          echo "Dependency-Check exit code: ${depcheck_rc}"
+
+      - name: Stage 3 - Convert Dependency-Check to Sonar issues
+        if: always()
+        run: |
+          set -euo pipefail
+          node scripts/depcheck-to-sonar.mjs \
+            reports/dependency-check-report.json \
+            reports/sonar-external-issues.json \
+            dast/dependency-findings.js
+
+      - name: Stage 3 - Upload Dependency-Check DAST source
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-dast-source
+          path: dast/dependency-findings.js
+          if-no-files-found: warn
+
+      - name: Stage 3 - Upload Trivy SARIF
+        if: always() && hashFiles('reports/trivy-fs.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/trivy-fs.sarif
+          category: trivy-filesystem
+        continue-on-error: true
+
+      - name: Stage 3 - Upload Trivy config SARIF
+        if: always() && hashFiles('reports/trivy-config.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/trivy-config.sarif
+          category: trivy-config
+        continue-on-error: true
+
+      - name: Stage 3 - Upload Dependency-Check SARIF
+        if: always() && hashFiles('reports/dependency-check-report.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/dependency-check-report.sarif
+          category: dependency-check
+        continue-on-error: true
+
+      - name: Stage 3 - Upload dependency reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-reports
+          path: reports/
+          if-no-files-found: warn
+
+      - name: Stage 3 - Enforce security gate
+        if: always()
+        run: |
+          set -euo pipefail
+          fs_rc="${TRIVY_FS_RC:-1}"
+          config_rc="${TRIVY_CONFIG_RC:-1}"
+          depcheck_rc="${DEPCHECK_RC:-1}"
+          failed=0
+          {
+            echo "## Stage 3: Dependency and file scans"
+            echo ""
+            echo "| Scanner | Exit code | Result |"
+            echo "|---|---|---|"
+            for pair in "Trivy filesystem:${fs_rc}" "Trivy config:${config_rc}" "Dependency-Check:${depcheck_rc}"; do
+              name="${pair%%:*}"
+              code="${pair##*:}"
+              if [ "$code" -eq 0 ]; then
+                echo "| ${name} | ${code} | pass |"
+              else
+                echo "| ${name} | ${code} | fail |"
+                failed=1
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::One or more security scans failed"
+            exit 1
+          fi
+
+  build-push:
+    name: Stage 4 - Build, scan, and push images
+    needs: deps-files-scan
+    if: github.event_name != 'pull_request'
+    runs-on: [self-hosted, linux, x64, mern-prod]
+    timeout-minutes: 45
+    steps:
+      - name: Stage 4 - Checkout
+        uses: actions/checkout@v4
+
+      - name: Stage 4 - Docker Hub login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Stage 4 - Print build plan
+        run: |
+          set -euo pipefail
+          echo "::group::Build plan"
+          echo "Backend image: ${DOCKERHUB_NAMESPACE}/mern-backend:${IMAGE_TAG}"
+          echo "Frontend image: ${DOCKERHUB_NAMESPACE}/mern-frontend:${IMAGE_TAG}"
+          echo "Images will be scanned before push"
+          echo "::endgroup::"
+          mkdir -p reports
+
+      - name: Stage 4 - Build backend image
+        run: |
+          set -euo pipefail
+          echo "::group::Backend Docker build"
+          docker build --progress=plain \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            -f backend/Dockerfile \
+            -t "${DOCKERHUB_NAMESPACE}/mern-backend:${IMAGE_TAG}" \
+            -t "${DOCKERHUB_NAMESPACE}/mern-backend:latest" \
+            .
+          echo "::endgroup::"
+
+      - name: Stage 4 - Build frontend image
+        run: |
+          set -euo pipefail
+          echo "::group::Frontend Docker build"
+          docker build --progress=plain \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            -f frontend/Dockerfile \
+            -t "${DOCKERHUB_NAMESPACE}/mern-frontend:${IMAGE_TAG}" \
+            -t "${DOCKERHUB_NAMESPACE}/mern-frontend:latest" \
+            frontend
+          echo "::endgroup::"
+
+      - name: Stage 4 - Scan backend image
+        id: scan-backend
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          echo "::group::Backend image scan"
+          set +e
+          trivy image \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            --ignore-unfixed \
+            --format table \
+            "${DOCKERHUB_NAMESPACE}/mern-backend:${IMAGE_TAG}" 2>&1 | tee reports/trivy-backend-image.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          trivy image \
+            --format sarif \
+            --output reports/trivy-backend.sarif \
+            "${DOCKERHUB_NAMESPACE}/mern-backend:${IMAGE_TAG}" >/dev/null 2>&1 || true
+          echo "::endgroup::"
+          echo "BACKEND_IMAGE_RC=$rc" >> "$GITHUB_ENV"
+          echo "Backend image scan exit code: ${rc}"
+          exit "$rc"
+
+      - name: Stage 4 - Scan frontend image
+        id: scan-frontend
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          echo "::group::Frontend image scan"
+          set +e
+          trivy image \
+            --severity HIGH,CRITICAL \
+            --exit-code 1 \
+            --ignore-unfixed \
+            --format table \
+            "${DOCKERHUB_NAMESPACE}/mern-frontend:${IMAGE_TAG}" 2>&1 | tee reports/trivy-frontend-image.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          trivy image \
+            --format sarif \
+            --output reports/trivy-frontend.sarif \
+            "${DOCKERHUB_NAMESPACE}/mern-frontend:${IMAGE_TAG}" >/dev/null 2>&1 || true
+          echo "::endgroup::"
+          echo "FRONTEND_IMAGE_RC=$rc" >> "$GITHUB_ENV"
+          echo "Frontend image scan exit code: ${rc}"
+          exit "$rc"
+
+      - name: Stage 4 - Generate SBOMs
+        if: always()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          echo "Generating CycloneDX SBOMs"
+          trivy image --format cyclonedx --output reports/sbom-backend.cdx.json "${DOCKERHUB_NAMESPACE}/mern-backend:${IMAGE_TAG}"
+          trivy image --format cyclonedx --output reports/sbom-frontend.cdx.json "${DOCKERHUB_NAMESPACE}/mern-frontend:${IMAGE_TAG}"
+
+      - name: Stage 4 - Upload image SARIF
+        if: always() && hashFiles('reports/trivy-backend.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/trivy-backend.sarif
+          category: trivy-backend-image
+        continue-on-error: true
+
+      - name: Stage 4 - Upload frontend SARIF
+        if: always() && hashFiles('reports/trivy-frontend.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/trivy-frontend.sarif
+          category: trivy-frontend-image
+        continue-on-error: true
+
+      - name: Stage 4 - Upload image reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-reports
+          path: reports/
+          if-no-files-found: warn
+
+      - name: Stage 4 - Push images to Docker Hub
+        if: steps.scan-backend.outcome == 'success' && steps.scan-frontend.outcome == 'success'
+        run: |
+          set -euo pipefail
+          echo "::group::Push backend"
+          docker push "${DOCKERHUB_NAMESPACE}/mern-backend:${IMAGE_TAG}"
+          docker push "${DOCKERHUB_NAMESPACE}/mern-backend:latest"
+          echo "::endgroup::"
+          echo "::group::Push frontend"
+          docker push "${DOCKERHUB_NAMESPACE}/mern-frontend:${IMAGE_TAG}"
+          docker push "${DOCKERHUB_NAMESPACE}/mern-frontend:latest"
+          echo "::endgroup::"
+          docker image inspect "${DOCKERHUB_NAMESPACE}/mern-backend:${IMAGE_TAG}" --format 'backend size: {{.Size}} bytes'
+          docker image inspect "${DOCKERHUB_NAMESPACE}/mern-frontend:${IMAGE_TAG}" --format 'frontend size: {{.Size}} bytes'
+
+      - name: Stage 4 - Enforce image scan gate
+        if: always()
+        run: |
+          set -euo pipefail
+          backend_rc="${BACKEND_IMAGE_RC:-1}"
+          frontend_rc="${FRONTEND_IMAGE_RC:-1}"
+          {
+            echo "## Stage 4: Image scans"
+            echo ""
+            echo "| Image | Exit code | Result |"
+            echo "|---|---|---|"
+            for pair in "Backend:${backend_rc}" "Frontend:${frontend_rc}"; do
+              name="${pair%%:*}"
+              code="${pair##*:}"
+              if [ "$code" -eq 0 ]; then
+                echo "| ${name} | ${code} | pass |"
+              else
+                echo "| ${name} | ${code} | fail |"
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$backend_rc" -ne 0 ] || [ "$frontend_rc" -ne 0 ]; then
+            echo "::error::Image scan failed; images were not pushed"
+            exit 1
+          fi
+
+  deploy:
+    name: Stage 5 - Deploy production stack
+    needs: build-push
+    if: github.event_name != 'pull_request'
+    runs-on: [self-hosted, linux, x64, mern-prod]
+    timeout-minutes: 20
+    environment:
+      name: production
+      url: ${{ vars.APP_URL }}
+    steps:
+      - name: Stage 5 - Checkout
+        uses: actions/checkout@v4
+
+      - name: Stage 5 - Validate deployment secrets
+        env:
+          MONGO_ROOT_USERNAME: ${{ secrets.MONGO_ROOT_USERNAME }}
+          MONGO_ROOT_PASSWORD: ${{ secrets.MONGO_ROOT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${MONGO_ROOT_USERNAME:?MONGO_ROOT_USERNAME is required in the production environment}"
+          : "${MONGO_ROOT_PASSWORD:?MONGO_ROOT_PASSWORD is required in the production environment}"
+          if ! printf '%s' "${MONGO_ROOT_USERNAME}" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]{2,31}$'; then
+            echo "::error::MONGO_ROOT_USERNAME must be 3-32 characters using letters, digits, dot, underscore, or hyphen"
+            exit 1
+          fi
+          if ! printf '%s' "${MONGO_ROOT_PASSWORD}" | grep -Eq '^[A-Za-z0-9._~-]{24,128}$'; then
+            echo "::error::MONGO_ROOT_PASSWORD must be 24-128 URL-safe characters (letters, digits, dot, underscore, tilde, hyphen)"
+            exit 1
+          fi
+          echo "Production secrets are present and URL-safe"
+
+      - name: Stage 5 - Write production environment file
+        env:
+          MONGO_ROOT_USERNAME: ${{ secrets.MONGO_ROOT_USERNAME }}
+          MONGO_ROOT_PASSWORD: ${{ secrets.MONGO_ROOT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d /opt/mern-app
+          previous_tag=""
+          if [ -f /opt/mern-app/.env ]; then
+            cp /opt/mern-app/.env /opt/mern-app/.env.previous
+            previous_tag=$(grep '^IMAGE_TAG=' /opt/mern-app/.env | cut -d= -f2- || true)
+          fi
+          echo "PREVIOUS_IMAGE_TAG=${previous_tag}" >> "$GITHUB_ENV"
+          umask 077
+          {
+            printf 'DOCKERHUB_NAMESPACE=%s\n' "${DOCKERHUB_NAMESPACE}"
+            printf 'IMAGE_TAG=%s\n' "${IMAGE_TAG}"
+            printf 'APP_PORT=%s\n' "80"
+            printf 'MONGO_ROOT_USERNAME=%s\n' "${MONGO_ROOT_USERNAME}"
+            printf 'MONGO_ROOT_PASSWORD=%s\n' "${MONGO_ROOT_PASSWORD}"
+          } > /opt/mern-app/.env
+          chmod 600 /opt/mern-app/.env
+          echo "Wrote /opt/mern-app/.env (values are not printed)"
+          if [ -n "$previous_tag" ]; then
+            echo "Previous image tag for rollback: ${previous_tag}"
+          fi
+
+      - name: Stage 5 - Docker Hub login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Stage 5 - Pull and start the stack
+        run: |
+          set -euo pipefail
+          echo "::group::Pull images"
+          docker compose -p mern-app -f docker-compose.yml --env-file /opt/mern-app/.env pull
+          echo "::endgroup::"
+          echo "::group::Start containers"
+          docker compose -p mern-app -f docker-compose.yml --env-file /opt/mern-app/.env up -d --remove-orphans
+          echo "::endgroup::"
+          echo "::group::Container status"
+          docker compose -p mern-app -f docker-compose.yml --env-file /opt/mern-app/.env ps
+          docker compose -p mern-app -f docker-compose.yml --env-file /opt/mern-app/.env logs --no-color --tail=100
+          docker stats --no-stream || true
+          echo "::endgroup::"
+
+      - name: Stage 5 - Smoke test with rollback
+        run: |
+          set -euo pipefail
+          echo "::group::Smoke test"
+          if bash scripts/smoke-test.sh http://127.0.0.1 30; then
+            echo "Smoke test passed"
+            echo "::endgroup::"
+          else
+            echo "::endgroup::"
+            echo "::error::Smoke test failed; attempting rollback"
+            if [ -n "${PREVIOUS_IMAGE_TAG:-}" ] && [ "${PREVIOUS_IMAGE_TAG}" != "${IMAGE_TAG}" ]; then
+              sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=${PREVIOUS_IMAGE_TAG}/" /opt/mern-app/.env
+              docker compose -p mern-app -f docker-compose.yml --env-file /opt/mern-app/.env pull || true
+              docker compose -p mern-app -f docker-compose.yml --env-file /opt/mern-app/.env up -d --remove-orphans || true
+              docker compose -p mern-app -f docker-compose.yml --env-file /opt/mern-app/.env ps
+              bash scripts/smoke-test.sh --health-only http://127.0.0.1 15 || true
+            else
+              echo "::warning::No previous image tag is available for rollback"
+            fi
+            exit 1
+          fi
+
+      - name: Stage 5 - Clean up old images
+        if: always()
+        run: |
+          docker image prune -f || true
+          docker builder prune -f --filter "until=24h" || true
+          df -h /
+
+      - name: Stage 5 - Deployment summary
+        if: always()
+        run: |
+          set -euo pipefail
+          public_ip=""
+          imds_token=$(curl -fsS -X PUT "http://169.254.169.254/latest/api/token" \
+            -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
+          if [ -n "$imds_token" ]; then
+            public_ip=$(curl -fsS -H "X-aws-ec2-metadata-token: ${imds_token}" \
+              "http://169.254.169.254/latest/meta-data/public-ipv4" 2>/dev/null || true)
+          fi
+          {
+            echo "## Stage 5: Deployment"
+            echo ""
+            echo "- Image tag: \`${IMAGE_TAG}\`"
+            echo "- Application URL: http://${public_ip:-<ec2-public-ip>}"
+            echo "- Containers:"
+            echo '```'
+            docker compose -p mern-app -f docker-compose.yml --env-file /opt/mern-app/.env ps || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  dast:
+    name: Stage 6 - Full active ZAP scan and Sonar import
+    needs: deploy
+    if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || inputs.run_dast)
+    runs-on: [self-hosted, linux, x64, mern-prod]
+    timeout-minutes: 45
+    env:
+      ZAP_RC: "1"
+    steps:
+      - name: Stage 6 - Checkout
+        uses: actions/checkout@v4
+
+      - name: Stage 6 - Download dependency reports
+        uses: actions/download-artifact@v4
+        with:
+          name: dependency-reports
+          path: reports
+
+      - name: Stage 6 - Download dependency DAST source
+        uses: actions/download-artifact@v4
+        with:
+          name: dependency-dast-source
+          path: dast
+
+      - name: Stage 6 - Print DAST plan
+        run: |
+          set -euo pipefail
+          echo "::group::DAST plan"
+          echo "Target: http://127.0.0.1:8080 (staging only)"
+          echo "Scanner: OWASP ZAP full active scan"
+          echo "Production data is not targeted"
+          echo "::endgroup::"
+          mkdir -p reports dast
+          chmod 777 reports
+
+      - name: Stage 6 - Docker Hub login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Stage 6 - Write staging environment
+        run: |
+          set -euo pipefail
+          install -m 700 -d /opt/mern-staging
+          staging_password=$(openssl rand -hex 24)
+          umask 077
+          {
+            printf 'DOCKERHUB_NAMESPACE=%s\n' "${DOCKERHUB_NAMESPACE}"
+            printf 'IMAGE_TAG=%s\n' "${IMAGE_TAG}"
+            printf 'STAGING_PORT=%s\n' "8080"
+            printf 'MONGO_ROOT_USERNAME=%s\n' "staging"
+            printf 'MONGO_ROOT_PASSWORD=%s\n' "${staging_password}"
+          } > /opt/mern-staging/.env.staging
+          chmod 600 /opt/mern-staging/.env.staging
+          echo "Wrote staging environment with throwaway credentials"
+
+      - name: Stage 6 - Start staging stack
+        run: |
+          set -euo pipefail
+          echo "::group::Start staging"
+          docker compose -p mern-staging -f docker-compose.staging.yml --env-file /opt/mern-staging/.env.staging down -v --remove-orphans || true
+          docker compose -p mern-staging -f docker-compose.staging.yml --env-file /opt/mern-staging/.env.staging pull
+          docker compose -p mern-staging -f docker-compose.staging.yml --env-file /opt/mern-staging/.env.staging up -d --remove-orphans
+          docker compose -p mern-staging -f docker-compose.staging.yml --env-file /opt/mern-staging/.env.staging ps
+          docker compose -p mern-staging -f docker-compose.staging.yml --env-file /opt/mern-staging/.env.staging logs --no-color --tail=80
+          echo "::endgroup::"
+          bash scripts/smoke-test.sh --health-only http://127.0.0.1:8080 30
+
+      - name: Stage 6 - Run full active ZAP scan
+        id: zap-scan
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          echo "::group::OWASP ZAP full scan"
+          set +e
+          docker run --rm --network host \
+            --memory=1200m \
+            -v "${PWD}/reports:/zap/wrk:rw" \
+            -v "${PWD}/scripts/zap-rules.tsv:/zap/zap-rules.tsv:ro" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-full-scan.py \
+            -t http://127.0.0.1:8080/ \
+            -P 8090 \
+            -m 2 \
+            -T 10 \
+            -j \
+            -r zap-report.html \
+            -J zap-report.json \
+            -w zap-report.md \
+            -x zap-report.xml \
+            -I \
+            -c /zap/zap-rules.tsv 2>&1 | tee reports/zap-scan.log
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "ZAP_RC=$rc" >> "$GITHUB_ENV"
+          echo "ZAP exit code: ${rc}"
+          echo "::endgroup::"
+          exit "$rc"
+
+      - name: Stage 6 - Stop staging stack
+        if: always()
+        run: |
+          echo "Tearing down staging stack and throwaway database"
+          docker compose -p mern-staging \
+            -f docker-compose.staging.yml \
+            --env-file /opt/mern-staging/.env.staging \
+            down -v --remove-orphans || true
+          free -h
+
+      - name: Stage 6 - Convert ZAP and Dependency-Check findings for SonarQube
+        if: always()
+        run: |
+          set -euo pipefail
+          node scripts/zap-to-sonar.mjs \
+            reports/zap-report.json \
+            reports/sonar-external-issues.json \
+            dast/zap-findings.js
+          jq '.issues | length' reports/sonar-external-issues.json
+
+      - name: Stage 6 - Start SonarQube for result import
+        if: always()
+        run: |
+          set -euo pipefail
+          docker compose -p sonarqube \
+            -f /opt/sonarqube/compose.yml \
+            --env-file /opt/sonarqube/.env \
+            up -d --remove-orphans
+          status=""
+          for attempt in $(seq 1 90); do
+            status=$(curl -fsS "${SONAR_HOST_URL}/api/system/status" 2>/dev/null | jq -r '.status // empty' 2>/dev/null || true)
+            echo "SonarQube status (${attempt}/90): ${status:-unreachable}"
+            if [ "$status" = "UP" ]; then
+              break
+            fi
+            sleep 5
+          done
+          if [ "$status" != "UP" ]; then
+            echo "::error::SonarQube did not become UP"
+            exit 1
+          fi
+
+      - name: Stage 6 - Import findings into SonarQube
+        id: sonar-dast
+        if: always()
+        continue-on-error: true
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "::group::SonarQube DAST import"
+          set +e
+          bash scripts/sonar-scan.sh \
+            "-Dsonar.externalIssuesReportPaths=reports/sonar-external-issues.json" \
+            2>&1 | tee reports/sonar-dast-scan.log
+          sonar_rc=${PIPESTATUS[0]}
+          set -e
+          curl -fsS -u "${SONAR_TOKEN}:" \
+            "${SONAR_HOST_URL}/api/qualitygates/project_status?projectKey=${SONAR_PROJECT_KEY}" \
+            -o reports/quality-gate-dast.json 2>/dev/null || true
+          if [ -f reports/quality-gate-dast.json ] && [ -s reports/quality-gate-dast.json ]; then
+            jq . reports/quality-gate-dast.json || true
+          fi
+          echo "SONAR_DAST_RC=$sonar_rc" >> "$GITHUB_ENV"
+          echo "::endgroup::"
+          exit "$sonar_rc"
+
+      - name: Stage 6 - Upload DAST reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dast-reports
+          path: reports/
+          if-no-files-found: warn
+
+      - name: Stage 6 - Stop SonarQube to free memory
+        if: always()
+        run: |
+          docker compose -p sonarqube \
+            -f /opt/sonarqube/compose.yml \
+            --env-file /opt/sonarqube/.env \
+            stop || true
+          free -h
+
+      - name: Stage 6 - Enforce DAST gate
+        if: always()
+        run: |
+          set -euo pipefail
+          zap_rc="${ZAP_RC:-1}"
+          sonar_rc="${SONAR_DAST_RC:-1}"
+          high=0
+          if [ -f reports/zap-report.json ] && [ -s reports/zap-report.json ]; then
+            high=$(jq '[.site[]?.alerts[]? | select(((.riskcode // "0") | tonumber) >= 3)] | length' reports/zap-report.json)
+          fi
+          {
+            echo "## Stage 6: DAST"
+            echo ""
+            echo "- ZAP exit code: \`${zap_rc}\`"
+            echo "- High-risk ZAP alerts: \`${high}\`"
+            echo "- SonarQube import exit code: \`${sonar_rc}\`"
+            echo "- Reports: ZAP HTML/JSON/Markdown/XML and Sonar external issues"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$zap_rc" -ne 0 ]; then
+            echo "::error::ZAP full scan failed with exit code ${zap_rc}"
+            exit 1
+          fi
+          if [ "$high" -gt 0 ]; then
+            echo "::error::ZAP reported ${high} High-risk alert(s)"
+            exit 1
+          fi
+          if [ "$sonar_rc" -ne 0 ]; then
+            echo "::error::SonarQube failed to import DAST results or the quality gate failed"
+            exit 1
+          fi
+
+  report:
+    name: Stage 7 - Final report
+    needs: [preflight, sast-quality, deps-files-scan, build-push, deploy, dast]
+    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: [self-hosted, linux, x64, mern-prod]
+    timeout-minutes: 10
+    steps:
+      - name: Stage 7 - Print final status
+        run: |
+          set -euo pipefail
+          echo "::group::Pipeline results"
+          echo "preflight: ${{ needs.preflight.result }}"
+          echo "sast-quality: ${{ needs.sast-quality.result }}"
+          echo "deps-files-scan: ${{ needs.deps-files-scan.result }}"
+          echo "build-push: ${{ needs.build-push.result }}"
+          echo "deploy: ${{ needs.deploy.result }}"
+          echo "dast: ${{ needs.dast.result }}"
+          echo "::endgroup::"
+
+      - name: Stage 7 - Print host status and access details
+        run: |
+          set -euo pipefail
+          public_ip=""
+          imds_token=$(curl -fsS -X PUT "http://169.254.169.254/latest/api/token" \
+            -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)
+          if [ -n "$imds_token" ]; then
+            public_ip=$(curl -fsS -H "X-aws-ec2-metadata-token: ${imds_token}" \
+              "http://169.254.169.254/latest/meta-data/public-ipv4" 2>/dev/null || true)
+          fi
+          echo "::group::Capacity"
+          free -h
+          df -h /
+          echo "::endgroup::"
+          echo "::group::Containers"
+          docker compose -p mern-app -f docker-compose.yml --env-file /opt/mern-app/.env ps || true
+          docker stats --no-stream || true
+          echo "::endgroup::"
+          {
+            echo "## Stage 7: Final report"
+            echo ""
+            echo "| Stage | Result |"
+            echo "|---|---|"
+            echo "| Preflight | ${{ needs.preflight.result }} |"
+            echo "| SAST + quality gate | ${{ needs.sast-quality.result }} |"
+            echo "| Dependency and file scans | ${{ needs.deps-files-scan.result }} |"
+            echo "| Build and push | ${{ needs.build-push.result }} |"
+            echo "| Deploy | ${{ needs.deploy.result }} |"
+            echo "| DAST | ${{ needs.dast.result }} |"
+            echo ""
+            echo "- Application: http://${public_ip:-<ec2-public-ip>}"
+            echo "- SonarQube (local only): ${SONAR_HOST_URL}"
+            echo "- Start SonarQube for review:"
+            echo '```'
+            echo "docker compose -p sonarqube -f /opt/sonarqube/compose.yml --env-file /opt/sonarqube/.env up -d"
+            echo '```'
+            echo "- SSH tunnel: \`ssh -L 9000:127.0.0.1:9000 <ec2-user>@${public_ip:-<ec2-public-ip>}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

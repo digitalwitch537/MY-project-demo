@@ -1,0 +1,3 @@
+# OWASP ZAP rule configuration for the full scan.
+# Format: <rule-id>\t<FAIL|WARN|IGNORE>\t<optional-url-regex>
+# Add rules here only after confirming they are false positives.

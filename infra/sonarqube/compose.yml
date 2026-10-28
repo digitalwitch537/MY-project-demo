@@ -1,0 +1,67 @@
+name: sonarqube
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${SONAR_DB_USER:-sonar}
+      POSTGRES_PASSWORD: ${SONAR_DB_PASSWORD:?SONAR_DB_PASSWORD is required}
+      POSTGRES_DB: sonarqube
+    command: ["postgres", "-c", "shared_buffers=128MB", "-c", "work_mem=8MB", "-c", "max_connections=50"]
+    volumes:
+      - sonar_db:/var/lib/postgresql/data
+    mem_limit: 320m
+    shm_size: 128mb
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "2"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d sonarqube"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  sonarqube:
+    image: sonarqube:community
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:9000:9000"
+    environment:
+      SONAR_JDBC_URL: jdbc:postgresql://db:5432/sonarqube
+      SONAR_JDBC_USERNAME: ${SONAR_DB_USER:-sonar}
+      SONAR_JDBC_PASSWORD: ${SONAR_DB_PASSWORD:?SONAR_DB_PASSWORD is required}
+      SONAR_WEB_JAVAOPTS: -Xmx512m
+      SONAR_CE_JAVAOPTS: -Xmx512m
+      SONAR_SEARCH_JAVAOPTS: -Xmx768m
+      SONAR_TELEMETRY_ENABLE: "false"
+    ulimits:
+      nofile:
+        soft: 131072
+        hard: 131072
+    volumes:
+      - sonar_data:/opt/sonarqube/data
+      - sonar_extensions:/opt/sonarqube/extensions
+      - sonar_logs:/opt/sonarqube/logs
+    mem_limit: 2560m
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+volumes:
+  sonar_db:
+    name: sonarqube-db
+  sonar_data:
+    name: sonarqube-data
+  sonar_extensions:
+    name: sonarqube-extensions
+  sonar_logs:
+    name: sonarqube-logs

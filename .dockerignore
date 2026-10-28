@@ -1,0 +1,16 @@
+.git
+.github
+node_modules
+frontend
+frontend/node_modules
+frontend/dist
+backend/node_modules
+dist
+coverage
+reports
+dast
+.env
+.env.*
+!.env.example
+*.log
+README.md

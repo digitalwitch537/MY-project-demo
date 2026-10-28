@@ -1,0 +1,169 @@
+name: Infrastructure Bootstrap
+
+on:
+  workflow_dispatch:
+    inputs:
+      install_runner:
+        description: Install and register the self-hosted GitHub Actions runner
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infrastructure-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    name: Bootstrap EC2, SonarQube, and runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Stage 1 - Checkout
+        uses: actions/checkout@v4
+
+      - name: Stage 1 - Show bootstrap target
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          set -euo pipefail
+          echo "::group::Bootstrap target"
+          echo "Host: ${EC2_HOST}"
+          echo "User: ${EC2_USER}"
+          echo "Repository: ${{ github.repository }}"
+          echo "Runner install: ${{ inputs.install_runner }}"
+          echo "Time: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          echo "::endgroup::"
+
+      - name: Stage 1 - Validate bootstrap secrets
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          SONAR_ADMIN_PASSWORD: ${{ secrets.SONAR_ADMIN_PASSWORD }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in EC2_HOST EC2_USER EC2_SSH_KEY SONAR_ADMIN_PASSWORD GH_PAT; do
+            value="${!name:-}"
+            if [ -z "$value" ]; then
+              echo "::error::Missing required secret ${name}"
+              missing=1
+            else
+              echo "${name}: present"
+            fi
+          done
+          exit "$missing"
+
+      - name: Stage 2 - Prepare SSH
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          echo "::group::Preparing SSH"
+          install -m 700 -d "$HOME/.ssh"
+          printf '%s\n' "$EC2_SSH_KEY" > "$HOME/.ssh/ec2_key"
+          chmod 600 "$HOME/.ssh/ec2_key"
+          ssh-keyscan -H "$EC2_HOST" >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          ssh -i "$HOME/.ssh/ec2_key" -o BatchMode=yes -o ConnectTimeout=15 "${EC2_USER}@${EC2_HOST}" "echo Connected to \$(hostname)"
+          echo "::endgroup::"
+
+      - name: Stage 2 - Copy bootstrap files
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          set -euo pipefail
+          echo "::group::Copying bootstrap files"
+          ssh -i "$HOME/.ssh/ec2_key" "${EC2_USER}@${EC2_HOST}" \
+            "sudo mkdir -p /opt/mern-bootstrap && sudo chown ${EC2_USER}:${EC2_USER} /opt/mern-bootstrap"
+          scp -i "$HOME/.ssh/ec2_key" -r \
+            infra scripts docker-compose.yml docker-compose.staging.yml .env.example \
+            "${EC2_USER}@${EC2_HOST}:/opt/mern-bootstrap/"
+          echo "Uploaded files to /opt/mern-bootstrap"
+          echo "::endgroup::"
+
+      - name: Stage 2 - Upload bootstrap secrets
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          SONAR_ADMIN_PASSWORD: ${{ secrets.SONAR_ADMIN_PASSWORD }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          REPO_SLUG: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          echo "::group::Uploading bootstrap secrets"
+          trap 'rm -f .bootstrap.env' EXIT
+          umask 077
+          {
+            printf 'SONAR_ADMIN_PASSWORD=%q\n' "${SONAR_ADMIN_PASSWORD}"
+            printf 'GH_PAT=%q\n' "${GH_PAT}"
+            printf 'REPO_SLUG=%q\n' "${REPO_SLUG}"
+            printf 'INSTALL_RUNNER=%s\n' "${{ inputs.install_runner }}"
+          } > .bootstrap.env
+          scp -i "$HOME/.ssh/ec2_key" .bootstrap.env "${EC2_USER}@${EC2_HOST}:/opt/mern-bootstrap/.bootstrap.env"
+          rm -f .bootstrap.env
+          echo "Secrets uploaded"
+          echo "::endgroup::"
+
+      - name: Stage 3 - Run EC2 bootstrap
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          set -euo pipefail
+          echo "::group::Running bootstrap on EC2"
+          ssh -i "$HOME/.ssh/ec2_key" "${EC2_USER}@${EC2_HOST}" \
+            "sudo -n bash /opt/mern-bootstrap/infra/ec2/bootstrap.sh"
+          echo "::endgroup::"
+
+      - name: Stage 3 - Remove remote bootstrap secrets
+        if: always()
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          ssh -i "$HOME/.ssh/ec2_key" -o BatchMode=yes -o ConnectTimeout=15 \
+            "${EC2_USER}@${EC2_HOST}" \
+            "sudo rm -f /opt/mern-bootstrap/.bootstrap.env" || true
+
+      - name: Stage 4 - Show bootstrap result
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          set -euo pipefail
+          echo "::group::Bootstrap summary"
+          ssh -i "$HOME/.ssh/ec2_key" "${EC2_USER}@${EC2_HOST}" \
+            "sudo cat /opt/sonarqube/bootstrap-summary.txt"
+          echo "Retrieve the Sonar token with:"
+          echo "ssh ${EC2_USER}@${EC2_HOST} 'sudo cat /opt/sonarqube/.sonar-token'"
+          echo "::endgroup::"
+
+      - name: Stage 4 - Sync Sonar token and URL to GitHub
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+          REPO: ${{ github.repository }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          echo "::group::Syncing SonarQube settings"
+          token=$(ssh -i "$HOME/.ssh/ec2_key" "${EC2_USER}@${EC2_HOST}" \
+            "sudo cat /opt/sonarqube/.sonar-token")
+          if [ -z "$token" ]; then
+            echo "::warning::Sonar token is empty; add SONAR_TOKEN manually"
+            exit 1
+          fi
+          printf '%s' "$token" | gh secret set SONAR_TOKEN --repo "$REPO"
+          gh variable set SONAR_HOST_URL --repo "$REPO" --body "http://127.0.0.1:9000"
+          echo "SONAR_TOKEN secret and SONAR_HOST_URL variable updated"
+          echo "::endgroup::"

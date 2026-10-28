@@ -13,6 +13,11 @@ dist-ssr
 *.local
 
 .env
+.env.*
+!.env.example
+.bootstrap.env
+reports/
+dast/dependency-findings.js
 
 # Editor directories and files
 .vscode/*
