@@ -193,14 +193,23 @@ curl -fsS -u "admin:${SONAR_ADMIN_PASSWORD}" -X POST "${SONAR_URL}/api/projects/
 	--data-urlencode "name=${SONAR_PROJECT_NAME}" >/dev/null 2>&1 || true
 
 log "Creating the security quality gate"
-gate_id=$(curl -fsS -u "admin:${SONAR_ADMIN_PASSWORD}" "${SONAR_URL}/api/qualitygates/list" \
-	| jq -r --arg name "$SONAR_QUALITY_GATE" '.qualitygates[] | select(.name == $name) | .id' | head -n 1)
+gate_id=$(curl -fsS -u "admin:${SONAR_ADMIN_PASSWORD}" "${SONAR_URL}/api/qualitygates/list" 2>/dev/null \
+	| jq -r --arg name "$SONAR_QUALITY_GATE" '.qualitygates[]? | select(.name == $name) | .id' | head -n 1)
 
 if [ -z "$gate_id" ] || [ "$gate_id" = "null" ]; then
-	gate_id=$(curl -fsS -u "admin:${SONAR_ADMIN_PASSWORD}" -X POST "${SONAR_URL}/api/qualitygates/create" \
-		--data-urlencode "name=${SONAR_QUALITY_GATE}" | jq -r '.id // empty') \
-		|| fail "could not create quality gate ${SONAR_QUALITY_GATE}"
-	[ -n "$gate_id" ] || fail "quality gate ${SONAR_QUALITY_GATE} was created without an id"
+	log "Quality gate not found, attempting to create: ${SONAR_QUALITY_GATE}"
+	create_resp=$(curl -fsS -u "admin:${SONAR_ADMIN_PASSWORD}" -X POST "${SONAR_URL}/api/qualitygates/create" \
+		--data-urlencode "name=${SONAR_QUALITY_GATE}" 2>/dev/null || true)
+	gate_id=$(echo "$create_resp" | jq -r '.id // .qualityGate.id // empty' 2>/dev/null || true)
+	if [ -z "$gate_id" ] || [ "$gate_id" = "null" ]; then
+		sleep 5
+		gate_id=$(curl -fsS -u "admin:${SONAR_ADMIN_PASSWORD}" "${SONAR_URL}/api/qualitygates/list" 2>/dev/null \
+			| jq -r --arg name "$SONAR_QUALITY_GATE" '.qualitygates[]? | select(.name == $name) | .id' | head -n 1)
+	fi
+fi
+
+if [ -z "$gate_id" ] || [ "$gate_id" = "null" ]; then
+	fail "quality gate ${SONAR_QUALITY_GATE} was created without an id"
 fi
 
 gate_json=$(curl -fsS -u "admin:${SONAR_ADMIN_PASSWORD}" "${SONAR_URL}/api/qualitygates/show?id=${gate_id}") \
