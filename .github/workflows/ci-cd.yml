@@ -18,8 +18,8 @@ permissions:
   security-events: write
 
 concurrency:
-  group: mern-pipeline
-  cancel-in-progress: false
+  group: mern-pipeline-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   DOCKERHUB_NAMESPACE: ${{ secrets.DOCKERHUB_USERNAME }}
