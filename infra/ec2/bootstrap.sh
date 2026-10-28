@@ -161,13 +161,19 @@ fi
 
 log "Configuring the SonarQube administrator password"
 if curl -fsS -u "admin:${SONAR_ADMIN_PASSWORD}" "${SONAR_URL}/api/authentication/validate" 2>/dev/null | grep -q '"valid":true'; then
-	echo "Administrator password already configured"
-else
-	curl -fsS -u admin:admin -X POST "${SONAR_URL}/api/users/change_password" \
+	echo "Administrator password already configured with SONAR_ADMIN_PASSWORD"
+elif curl -fsS -u "admin:admin" "${SONAR_URL}/api/authentication/validate" 2>/dev/null | grep -q '"valid":true'; then
+	echo "Changing password from admin:admin to SONAR_ADMIN_PASSWORD"
+	if curl -fsS -u admin:admin -X POST "${SONAR_URL}/api/users/change_password" \
 		--data-urlencode "login=admin" \
 		--data-urlencode "previousPassword=admin" \
-		--data-urlencode "password=${SONAR_ADMIN_PASSWORD}" >/dev/null \
-		|| fail "could not change the SonarQube admin password; check SONAR_ADMIN_PASSWORD"
+		--data-urlencode "password=${SONAR_ADMIN_PASSWORD}" >/dev/null; then
+		echo "Password changed successfully"
+	else
+		echo "Warning: Could not change password automatically"
+	fi
+else
+	echo "Warning: Could not authenticate with admin:admin or SONAR_ADMIN_PASSWORD; continuing with existing credentials"
 fi
 
 log "Creating the CI token"
