@@ -97,10 +97,17 @@ jobs:
           status=$(curl -fsS "${SONAR_HOST_URL}/api/system/status" 2>/dev/null | jq -r '.status // empty' 2>/dev/null || true)
           if [ "$status" != "UP" ]; then
             echo "SonarQube is ${status:-unreachable}; starting it..."
-            sudo docker compose -p sonarqube \
-              -f /opt/sonarqube/compose.yml \
-              --env-file /opt/sonarqube/.env \
-              up -d --remove-orphans
+            if sudo -n true 2>/dev/null; then
+              sudo docker compose -p sonarqube \
+                -f /opt/sonarqube/compose.yml \
+                --env-file /opt/sonarqube/.env \
+                up -d --remove-orphans
+            else
+              docker compose -p sonarqube \
+                -f /opt/sonarqube/compose.yml \
+                --env-file /opt/sonarqube/.env \
+                up -d --remove-orphans
+            fi
           fi
           for attempt in $(seq 1 90); do
             status=$(curl -fsS "${SONAR_HOST_URL}/api/system/status" 2>/dev/null | jq -r '.status // empty' 2>/dev/null || true)
@@ -111,11 +118,19 @@ jobs:
             sleep 5
           done
           if [ "$status" != "UP" ]; then
-            sudo docker compose -p sonarqube -f /opt/sonarqube/compose.yml --env-file /opt/sonarqube/.env logs --tail=200 sonarqube || true
+            if sudo -n true 2>/dev/null; then
+              sudo docker compose -p sonarqube -f /opt/sonarqube/compose.yml --env-file /opt/sonarqube/.env logs --tail=200 sonarqube || true
+            else
+              docker compose -p sonarqube -f /opt/sonarqube/compose.yml --env-file /opt/sonarqube/.env logs --tail=200 sonarqube || true
+            fi
             echo "::error::SonarQube did not become UP"
             exit 1
           fi
-          sudo docker compose -p sonarqube -f /opt/sonarqube/compose.yml --env-file /opt/sonarqube/.env ps
+          if sudo -n true 2>/dev/null; then
+            sudo docker compose -p sonarqube -f /opt/sonarqube/compose.yml --env-file /opt/sonarqube/.env ps
+          else
+            docker compose -p sonarqube -f /opt/sonarqube/compose.yml --env-file /opt/sonarqube/.env ps
+          fi
           echo "::endgroup::"
 
       - name: Stage 1 - Ensure security quality gate exists
@@ -129,7 +144,6 @@ jobs:
           set -euo pipefail
           echo "::group::Quality gate setup"
           AUTH=""
-          # Try token first if available
           if [ -n "${SONAR_TOKEN:-}" ]; then
             AUTH="admin:${SONAR_TOKEN}"
           fi
@@ -147,16 +161,13 @@ jobs:
             echo "Creating security-gate..."
             curl -s -u "$AUTH" -X POST "${SONAR_HOST_URL}/api/qualitygates/create" \
               --data-urlencode "name=security-gate" >/dev/null 2>&1 || true
-            sleep 5
+            sleep 8
             gate_id=$(curl -fsS -u "$AUTH" "${SONAR_HOST_URL}/api/qualitygates/list" 2>/dev/null \
               | jq -r '.qualitygates[]? | select(.name=="security-gate") | .id' 2>/dev/null | head -n 1)
           fi
           
           if [ -n "$gate_id" ] && [ "$gate_id" != "null" ]; then
             echo "Gate ID: $gate_id"
-            for m in "new_security_rating" "new_vulnerabilities" "new_bugs" "new_security_hotspots_reviewed"; do
-              : 
-            done
             curl -s -u "$AUTH" -X POST "${SONAR_HOST_URL}/api/qualitygates/create_condition" \
               --data-urlencode "gateId=${gate_id}" --data-urlencode "metric=new_security_rating" \
               --data-urlencode "op=GT" --data-urlencode "error=1" >/dev/null 2>&1 || true
@@ -173,7 +184,7 @@ jobs:
               --data-urlencode "gateId=${gate_id}" --data-urlencode "projectKey=${SONAR_PROJECT_KEY}" >/dev/null 2>&1 || true
             echo "Quality gate configured"
           else
-            echo "Could not configure quality gate"
+            echo "::warning::Could not configure security-gate; pipeline will continue"
           fi
           echo "::endgroup::"
 
