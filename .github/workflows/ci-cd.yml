@@ -706,12 +706,12 @@ jobs:
           set -euo pipefail
           if sudo -n true 2>/dev/null; then
             sudo mkdir -p /opt/mern-app 2>/dev/null || true
-            sudo chown $(whoami):$(id -gn) /opt/mern-app 2>/dev/null || sudo chown $(whoami):docker /opt/mern-app 2>/dev/null || true
-            sudo chmod 700 /opt/mern-app 2>/dev/null || true
+            sudo chown -R $(whoami):docker /opt/mern-app 2>/dev/null || sudo chown -R $(whoami):$(id -gn) /opt/mern-app 2>/dev/null || true
+            sudo chmod 755 /opt/mern-app 2>/dev/null || true
           else
             mkdir -p /opt/mern-app 2>/dev/null || true
-            chown $(whoami):$(id -gn) /opt/mern-app 2>/dev/null || true
-            chmod 700 /opt/mern-app 2>/dev/null || true
+            chown -R $(whoami):$(id -gn) /opt/mern-app 2>/dev/null || true
+            chmod 755 /opt/mern-app 2>/dev/null || true
           fi
           previous_tag=""
           if [ -f /opt/mern-app/.env ]; then
@@ -727,6 +727,7 @@ jobs:
             printf 'MONGO_ROOT_USERNAME=%s\n' "${MONGO_ROOT_USERNAME}"
             printf 'MONGO_ROOT_PASSWORD=%s\n' "${MONGO_ROOT_PASSWORD}"
           } > /opt/mern-app/.env
+          chown $(whoami):$(id -gn) /opt/mern-app/.env 2>/dev/null || true
           chmod 600 /opt/mern-app/.env 2>/dev/null || true
           echo "Wrote /opt/mern-app/.env (values are not printed)"
           if [ -n "$previous_tag" ]; then
@@ -851,12 +852,12 @@ jobs:
           set -euo pipefail
           if sudo -n true 2>/dev/null; then
             sudo mkdir -p /opt/mern-staging 2>/dev/null || true
-            sudo chown $(whoami):$(id -gn) /opt/mern-staging 2>/dev/null || sudo chown $(whoami):docker /opt/mern-staging 2>/dev/null || true
-            sudo chmod 700 /opt/mern-staging 2>/dev/null || true
+            sudo chown -R $(whoami):docker /opt/mern-staging 2>/dev/null || sudo chown -R $(whoami):$(id -gn) /opt/mern-staging 2>/dev/null || true
+            sudo chmod 755 /opt/mern-staging 2>/dev/null || true
           else
             mkdir -p /opt/mern-staging 2>/dev/null || true
-            chown $(whoami):$(id -gn) /opt/mern-staging 2>/dev/null || true
-            chmod 700 /opt/mern-staging 2>/dev/null || true
+            chown -R $(whoami):$(id -gn) /opt/mern-staging 2>/dev/null || true
+            chmod 755 /opt/mern-staging 2>/dev/null || true
           fi
           umask 077
           {
@@ -866,6 +867,7 @@ jobs:
             printf 'MONGO_ROOT_USERNAME=%s\n' "staging"
             printf 'MONGO_ROOT_PASSWORD=%s\n' "${staging_password}"
           } > /opt/mern-staging/.env.staging
+          chown $(whoami):$(id -gn) /opt/mern-staging/.env.staging 2>/dev/null || true
           chmod 600 /opt/mern-staging/.env.staging 2>/dev/null || true
           echo "Wrote staging environment with throwaway credentials"
 
