@@ -704,11 +704,19 @@ jobs:
           MONGO_ROOT_PASSWORD: ${{ secrets.MONGO_ROOT_PASSWORD }}
         run: |
           set -euo pipefail
-          install -m 700 -d /opt/mern-app
+          if sudo -n true 2>/dev/null; then
+            sudo mkdir -p /opt/mern-app 2>/dev/null || true
+            sudo chown $(whoami):$(id -gn) /opt/mern-app 2>/dev/null || sudo chown $(whoami):docker /opt/mern-app 2>/dev/null || true
+            sudo chmod 700 /opt/mern-app 2>/dev/null || true
+          else
+            mkdir -p /opt/mern-app 2>/dev/null || true
+            chown $(whoami):$(id -gn) /opt/mern-app 2>/dev/null || true
+            chmod 700 /opt/mern-app 2>/dev/null || true
+          fi
           previous_tag=""
           if [ -f /opt/mern-app/.env ]; then
-            cp /opt/mern-app/.env /opt/mern-app/.env.previous
-            previous_tag=$(grep '^IMAGE_TAG=' /opt/mern-app/.env | cut -d= -f2- || true)
+            cp /opt/mern-app/.env /opt/mern-app/.env.previous 2>/dev/null || true
+            previous_tag=$(grep '^IMAGE_TAG=' /opt/mern-app/.env 2>/dev/null | cut -d= -f2- || true)
           fi
           echo "PREVIOUS_IMAGE_TAG=${previous_tag}" >> "$GITHUB_ENV"
           umask 077
@@ -719,7 +727,7 @@ jobs:
             printf 'MONGO_ROOT_USERNAME=%s\n' "${MONGO_ROOT_USERNAME}"
             printf 'MONGO_ROOT_PASSWORD=%s\n' "${MONGO_ROOT_PASSWORD}"
           } > /opt/mern-app/.env
-          chmod 600 /opt/mern-app/.env
+          chmod 600 /opt/mern-app/.env 2>/dev/null || true
           echo "Wrote /opt/mern-app/.env (values are not printed)"
           if [ -n "$previous_tag" ]; then
             echo "Previous image tag for rollback: ${previous_tag}"
@@ -841,8 +849,15 @@ jobs:
       - name: Stage 6 - Write staging environment
         run: |
           set -euo pipefail
-          install -m 700 -d /opt/mern-staging
-          staging_password=$(openssl rand -hex 24)
+          if sudo -n true 2>/dev/null; then
+            sudo mkdir -p /opt/mern-staging 2>/dev/null || true
+            sudo chown $(whoami):$(id -gn) /opt/mern-staging 2>/dev/null || sudo chown $(whoami):docker /opt/mern-staging 2>/dev/null || true
+            sudo chmod 700 /opt/mern-staging 2>/dev/null || true
+          else
+            mkdir -p /opt/mern-staging 2>/dev/null || true
+            chown $(whoami):$(id -gn) /opt/mern-staging 2>/dev/null || true
+            chmod 700 /opt/mern-staging 2>/dev/null || true
+          fi
           umask 077
           {
             printf 'DOCKERHUB_NAMESPACE=%s\n' "${DOCKERHUB_NAMESPACE}"
@@ -851,7 +866,7 @@ jobs:
             printf 'MONGO_ROOT_USERNAME=%s\n' "staging"
             printf 'MONGO_ROOT_PASSWORD=%s\n' "${staging_password}"
           } > /opt/mern-staging/.env.staging
-          chmod 600 /opt/mern-staging/.env.staging
+          chmod 600 /opt/mern-staging/.env.staging 2>/dev/null || true
           echo "Wrote staging environment with throwaway credentials"
 
       - name: Stage 6 - Start staging stack
