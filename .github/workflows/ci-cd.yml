@@ -101,11 +101,15 @@ jobs:
               sudo docker compose -p sonarqube \
                 -f /opt/sonarqube/compose.yml \
                 --env-file /opt/sonarqube/.env \
+                up -d --remove-orphans 2>/dev/null || sudo docker compose -p sonarqube \
+                -f /opt/sonarqube/compose.yml \
                 up -d --remove-orphans
             else
               docker compose -p sonarqube \
                 -f /opt/sonarqube/compose.yml \
                 --env-file /opt/sonarqube/.env \
+                up -d --remove-orphans 2>/dev/null || docker compose -p sonarqube \
+                -f /opt/sonarqube/compose.yml \
                 up -d --remove-orphans
             fi
           fi
@@ -119,17 +123,17 @@ jobs:
           done
           if [ "$status" != "UP" ]; then
             if sudo -n true 2>/dev/null; then
-              sudo docker compose -p sonarqube -f /opt/sonarqube/compose.yml --env-file /opt/sonarqube/.env logs --tail=200 sonarqube || true
+              sudo docker compose -p sonarqube -f /opt/sonarqube/compose.yml --env-file /opt/sonarqube/.env logs --tail=200 sonarqube 2>/dev/null || sudo docker compose -p sonarqube -f /opt/sonarqube/compose.yml logs --tail=200 sonarqube || true
             else
-              docker compose -p sonarqube -f /opt/sonarqube/compose.yml --env-file /opt/sonarqube/.env logs --tail=200 sonarqube || true
+              docker compose -p sonarqube -f /opt/sonarqube/compose.yml --env-file /opt/sonarqube/.env logs --tail=200 sonarqube 2>/dev/null || docker compose -p sonarqube -f /opt/sonarqube/compose.yml logs --tail=200 sonarqube || true
             fi
             echo "::error::SonarQube did not become UP"
             exit 1
           fi
           if sudo -n true 2>/dev/null; then
-            sudo docker compose -p sonarqube -f /opt/sonarqube/compose.yml --env-file /opt/sonarqube/.env ps
+            sudo docker compose -p sonarqube -f /opt/sonarqube/compose.yml --env-file /opt/sonarqube/.env ps 2>/dev/null || sudo docker compose -p sonarqube -f /opt/sonarqube/compose.yml ps
           else
-            docker compose -p sonarqube -f /opt/sonarqube/compose.yml --env-file /opt/sonarqube/.env ps
+            docker compose -p sonarqube -f /opt/sonarqube/compose.yml --env-file /opt/sonarqube/.env ps 2>/dev/null || docker compose -p sonarqube -f /opt/sonarqube/compose.yml ps
           fi
           echo "::endgroup::"
 
