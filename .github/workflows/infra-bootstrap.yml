@@ -134,12 +134,12 @@ jobs:
           ssh -i "$HOME/.ssh/ec2_key" "${EC2_USER}@${EC2_HOST}" << 'EOF'
             sudo usermod -aG docker ${USER} || true
             sudo usermod -aG docker github-runner || true
+            sudo rm -f /opt/sonarqube/.env /opt/sonarqube/.env.* 2>/dev/null || true
             sudo chown -R ${USER}:docker /opt/sonarqube 2>/dev/null || sudo chown -R ubuntu:docker /opt/sonarqube 2>/dev/null || true
             sudo chown -R ${USER}:docker /opt/mern-app 2>/dev/null || true
             sudo chown -R ${USER}:docker /opt/mern-staging 2>/dev/null || true
-            sudo chmod 750 /opt/sonarqube 2>/dev/null || true
+            sudo chmod 755 /opt/sonarqube 2>/dev/null || true
             sudo chmod 644 /opt/sonarqube/compose.yml 2>/dev/null || true
-            if [ -f /opt/sonarqube/.env ]; then sudo chmod 600 /opt/sonarqube/.env 2>/dev/null || true; fi
             if [ -f /opt/sonarqube/.sonar-token ]; then sudo chmod 644 /opt/sonarqube/.sonar-token 2>/dev/null || true; fi
           EOF
           echo "::endgroup::"

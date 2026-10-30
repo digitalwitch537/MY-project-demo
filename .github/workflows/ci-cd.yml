@@ -89,15 +89,12 @@ jobs:
         run: |
           set -euo pipefail
           echo "::group::SonarQube startup"
-          # Fix permissions
+          # Fix permissions and remove any env file that may block docker compose
           sudo usermod -aG docker $(whoami) 2>/dev/null || true
-          sudo chown -R $(whoami):docker /opt/sonarqube 2>/dev/null || true
+          sudo rm -f /opt/sonarqube/.env /opt/sonarqube/.env.* 2>/dev/null || true
+          sudo chown -R $(whoami):docker /opt/sonarqube 2>/dev/null || sudo chown -R ubuntu:docker /opt/sonarqube 2>/dev/null || true
           sudo chmod 755 /opt/sonarqube 2>/dev/null || true
           sudo chmod 644 /opt/sonarqube/compose.yml 2>/dev/null || true
-          if [ -f /opt/sonarqube/.env ]; then
-            sudo chown root:root /opt/sonarqube/.env 2>/dev/null || true
-            sudo chmod 600 /opt/sonarqube/.env 2>/dev/null || true
-          fi
           status=$(curl -fsS "${SONAR_HOST_URL}/api/system/status" 2>/dev/null | jq -r '.status // empty' 2>/dev/null || true)
           if [ "$status" != "UP" ]; then
             echo "SonarQube is ${status:-unreachable}; starting it..."
