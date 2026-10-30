@@ -125,22 +125,13 @@ cp "${BOOTSTRAP_ROOT}/infra/sonarqube/compose.yml" /opt/sonarqube/compose.yml
 chown -R "${RUNNER_USER}:${RUNNER_USER}" /opt/sonarqube /opt/mern-app /opt/mern-staging /opt/backups
 chmod 750 /opt/sonarqube /opt/mern-app /opt/mern-staging /opt/backups
 
-if [ ! -f /opt/sonarqube/.env ]; then
-	umask 077
-	cat > /opt/sonarqube/.env <<EOF
-SONAR_DB_USER=sonar
-SONAR_DB_PASSWORD=$(openssl rand -hex 24)
-EOF
-	chown "${RUNNER_USER}:${RUNNER_USER}" /opt/sonarqube/.env
-	chmod 600 /opt/sonarqube/.env
-fi
+rm -f /opt/sonarqube/.env /opt/sonarqube/.env.* 2>/dev/null || true
 
 docker volume create depcheck-data >/dev/null
 
 log "Starting SonarQube and PostgreSQL"
 docker compose -p sonarqube \
 	-f /opt/sonarqube/compose.yml \
-	--env-file /opt/sonarqube/.env \
 	up -d --remove-orphans
 
 log "Waiting for SonarQube to become UP"
@@ -155,7 +146,7 @@ for attempt in $(seq 1 90); do
 done
 
 if [ "$sonar_status" != "UP" ]; then
-	docker compose -p sonarqube -f /opt/sonarqube/compose.yml --env-file /opt/sonarqube/.env logs --tail=200 sonarqube || true
+	docker compose -p sonarqube -f /opt/sonarqube/compose.yml logs --tail=200 sonarqube || true
 	fail "SonarQube did not become UP"
 fi
 
