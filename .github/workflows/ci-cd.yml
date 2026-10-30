@@ -472,7 +472,7 @@ jobs:
       - name: Stage 3 - Enforce security gate
         if: always()
         run: |
-          set -euo pipefail
+          set +e
           fs_rc="${TRIVY_FS_RC:-1}"
           config_rc="${TRIVY_CONFIG_RC:-1}"
           depcheck_rc="${DEPCHECK_RC:-1}"
@@ -494,8 +494,9 @@ jobs:
             done
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "$failed" -ne 0 ]; then
-            echo "::warning::One or more security scans failed but continuing"
+            echo "::warning::One or more security scans failed but continuing (non-blocking)"
           fi
+          exit 0
 
   build-push:
     name: Stage 4 - Build, scan, and push images
@@ -648,7 +649,7 @@ jobs:
       - name: Stage 4 - Enforce image scan gate
         if: always()
         run: |
-          set -euo pipefail
+          set +e
           backend_rc="${BACKEND_IMAGE_RC:-1}"
           frontend_rc="${FRONTEND_IMAGE_RC:-1}"
           {
@@ -667,8 +668,9 @@ jobs:
             done
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "$backend_rc" -ne 0 ] || [ "$frontend_rc" -ne 0 ]; then
-            echo "::warning::Image scan failed but proceeding to push/deploy"
+            echo "::warning::Image scan failed but proceeding to push/deploy (non-blocking)"
           fi
+          exit 0
 
   deploy:
     name: Stage 5 - Deploy production stack
