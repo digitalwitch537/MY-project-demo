@@ -703,13 +703,15 @@ jobs:
         run: |
           set -euo pipefail
           if sudo -n true 2>/dev/null; then
+            sudo rm -f /opt/mern-app/.env /opt/mern-app/.env.previous 2>/dev/null || true
             sudo mkdir -p /opt/mern-app 2>/dev/null || true
             sudo chown -R $(whoami):docker /opt/mern-app 2>/dev/null || sudo chown -R $(whoami):$(id -gn) /opt/mern-app 2>/dev/null || true
-            sudo chmod 755 /opt/mern-app 2>/dev/null || true
+            sudo chmod 775 /opt/mern-app 2>/dev/null || true
           else
+            rm -f /opt/mern-app/.env /opt/mern-app/.env.previous 2>/dev/null || true
             mkdir -p /opt/mern-app 2>/dev/null || true
             chown -R $(whoami):$(id -gn) /opt/mern-app 2>/dev/null || true
-            chmod 755 /opt/mern-app 2>/dev/null || true
+            chmod 775 /opt/mern-app 2>/dev/null || true
           fi
           previous_tag=""
           if [ -f /opt/mern-app/.env ]; then
@@ -849,13 +851,15 @@ jobs:
         run: |
           set -euo pipefail
           if sudo -n true 2>/dev/null; then
+            sudo rm -f /opt/mern-staging/.env.staging 2>/dev/null || true
             sudo mkdir -p /opt/mern-staging 2>/dev/null || true
             sudo chown -R $(whoami):docker /opt/mern-staging 2>/dev/null || sudo chown -R $(whoami):$(id -gn) /opt/mern-staging 2>/dev/null || true
-            sudo chmod 755 /opt/mern-staging 2>/dev/null || true
+            sudo chmod 775 /opt/mern-staging 2>/dev/null || true
           else
+            rm -f /opt/mern-staging/.env.staging 2>/dev/null || true
             mkdir -p /opt/mern-staging 2>/dev/null || true
             chown -R $(whoami):$(id -gn) /opt/mern-staging 2>/dev/null || true
-            chmod 755 /opt/mern-staging 2>/dev/null || true
+            chmod 775 /opt/mern-staging 2>/dev/null || true
           fi
           umask 077
           {
